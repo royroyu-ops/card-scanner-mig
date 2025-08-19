@@ -1,63 +1,68 @@
-// /api/ocr.js  (Vercel Serverless Function - CommonJS)
+// /api/ocr.js — Vercel Serverless Function (CommonJS)
+const Busboy = require("busboy");
+
 module.exports = async (req, res) => {
-  if (req.method !== 'POST') {
+  if (req.method !== "POST") {
     res.statusCode = 405;
-    return res.json({ error: 'Method not allowed' });
+    return res.json({ error: "Method not allowed" });
   }
 
   try {
-    const body = await readJson(req);
-    const imageBase64 = body?.imageBase64;
-    if (!imageBase64) {
+    const { files } = await parseMultipart(req);
+    const img = files?.image;
+    if (!img) {
       res.statusCode = 400;
-      return res.json({ error: 'imageBase64 required' });
+      return res.json({ error: "No image uploaded (field 'image' missing)" });
     }
 
-    const endpoint = process.env.OPTIIC_API_ENDPOINT || 'https://api.optiic.dev/ocr';
-    const apiKey   = process.env.OPTIIC_API_KEY;
+    // Build multipart form for Optiic
+    const form = new FormData();
+    form.append("apiKey", process.env.OPTIIC_API_KEY || ""); // boleh kosong (akaun free tanpa key)
+    form.append("image", new Blob([img.buffer], { type: img.mime }), img.filename);
 
-    if (!apiKey) {
-      res.statusCode = 500;
-      return res.json({ error: 'Missing OPTIIC_API_KEY env' });
-    }
-
-    const upstream = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        // Sesetengah OCR guna Authorization Bearer, sesetengah "x-api-key".
-        // Tukar jika perlu ikut docs Optiic anda.
-        'x-api-key': apiKey,
-        // 'Authorization': `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({ image: imageBase64 }),
+    // **Official endpoint per README:** https://api.optiic.dev/process
+    const upstream = await fetch("https://api.optiic.dev/process", {
+      method: "POST",
+      body: form,
+      // header Content-Type akan di-set automatik oleh fetch untuk multipart boundary
     });
 
     const data = await upstream.json().catch(() => ({}));
     if (!upstream.ok) {
       res.statusCode = upstream.status || 502;
-      return res.json({ error: 'Optiic error', raw: data });
+      return res.json({ error: "Optiic error", raw: data });
     }
 
-    // Normalise field text
-    const text = data.text || data.ocr || data.result || data.data?.text || '';
-    return res.json({ text, raw: data });
-  } catch (err) {
-    console.error(err);
+    // README tunjuk output ada `text` (contoh “We love Optiic!”)
+    const text = data.text || data.ocr || data.result || data.data?.text || "";
+    return res.status(200).json({ text, raw: data });
+  } catch (e) {
+    console.error(e);
     res.statusCode = 500;
-    return res.json({ error: 'Server error', detail: String(err) });
+    return res.json({ error: "Server error", detail: String(e) });
   }
 };
 
-// ---- helpers ----
-function readJson(req) {
+// ---------- helpers ----------
+function parseMultipart(req) {
   return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', () => {
-      try { resolve(body ? JSON.parse(body) : {}); }
-      catch (e) { reject(e); }
+    const bb = Busboy({ headers: req.headers });
+    const files = {};
+    const fields = {};
+    bb.on("file", (name, file, info) => {
+      const chunks = [];
+      file.on("data", (d) => chunks.push(d));
+      file.on("end", () => {
+        files[name] = {
+          buffer: Buffer.concat(chunks),
+          filename: info.filename || "upload",
+          mime: info.mimeType || "application/octet-stream",
+        };
+      });
     });
-    req.on('error', reject);
+    bb.on("field", (name, val) => (fields[name] = val));
+    bb.on("close", () => resolve({ files, fields }));
+    bb.on("error", reject);
+    req.pipe(bb);
   });
 }
